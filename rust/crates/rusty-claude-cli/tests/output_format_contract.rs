@@ -112,6 +112,7 @@ fn assert_doctor_help_json_contract(parsed: &Value) {
     assert!(checks.iter().any(|check| check == "boot preflight"));
     assert!(checks.iter().any(|check| check == "memory"));
     assert!(checks.iter().any(|check| check == "mcp validation"));
+    assert!(checks.iter().any(|check| check == "hook validation"));
 }
 
 #[test]
@@ -840,14 +841,19 @@ fn acp_guidance_emits_json_when_requested() {
     let root = unique_temp_dir("acp-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
 
-    let acp = assert_json_command(&root, &["--output-format", "json", "acp"]);
+    // #443: acp serve exits 2 (not implemented) instead of 0
+    let output = run_claw(&root, &["--output-format", "json", "acp"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "acp should exit 2 (not implemented)"
+    );
+    let acp: Value =
+        serde_json::from_slice(&output.stdout).expect("acp stdout should be valid json");
     assert_eq!(acp["kind"], "acp");
     assert_eq!(acp["schema_version"], "1.0");
-    assert_eq!(acp["status"], "unsupported");
-    assert_eq!(acp["phase"], "discoverability_only");
+    assert_eq!(acp["status"], "not_implemented");
     assert_eq!(acp["supported"], false);
-    assert_eq!(acp["exit_code"], 0);
-    assert_eq!(acp["serve_alias_only"], true);
     assert_eq!(acp["protocol"]["json_rpc"], false);
     assert_eq!(acp["protocol"]["daemon"], false);
     assert!(acp["protocol"]["endpoint"].is_null());
@@ -855,12 +861,23 @@ fn acp_guidance_emits_json_when_requested() {
         acp["contracts"]["unsupported_invocation_kind"],
         "unsupported_acp_invocation"
     );
-    assert_eq!(acp["discoverability_tracking"], "ROADMAP #64a");
-    assert_eq!(acp["tracking"], "ROADMAP #76 / #3033 / #3004");
+    // #443: internal tracking IDs removed from public JSON
+    assert!(
+        acp.get("discoverability_tracking").is_none(),
+        "discoverability_tracking should be removed (#443)"
+    );
+    assert!(
+        acp.get("tracking").is_none(),
+        "tracking should be removed (#443)"
+    );
+    assert!(
+        acp.get("recommended_workflows").is_none(),
+        "recommended_workflows should be removed (#443)"
+    );
     assert!(acp["message"]
         .as_str()
         .expect("acp message")
-        .contains("discoverability alias"));
+        .contains("not implemented"));
 }
 
 #[test]
@@ -1459,7 +1476,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .is_some_and(|available| available.iter().any(|name| name == "web_fetch")));
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 10);
+    assert_eq!(checks.len(), 12);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -1479,8 +1496,10 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         check_names,
         vec![
             "auth",
+            "base urls",
             "config",
             "mcp validation",
+            "hook validation",
             "install source",
             "workspace",
             "memory",
@@ -2063,7 +2082,7 @@ fn local_json_surfaces_have_non_empty_action_contract_714() {
             &git_workspace,
             strings(&["--output-format", "json", "diff"]),
         ),
-        (&workspace, strings(&["--output-format", "json", "acp"])),
+        // #443: ACP exits 2 (not implemented); tested separately in acp_guidance_emits_json_when_requested
         (&workspace, strings(&["--output-format", "json", "config"])),
         (
             &workspace,
@@ -3346,7 +3365,7 @@ fn config_unsupported_section_json_hint_741() {
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
 
-    for section in &["list", "show", "bogus", "help"] {
+    for section in &["list", "show", "bogus"] {
         let output = Command::new(bin)
             .current_dir(&root)
             .args(["--output-format", "json", "config", section])
@@ -3382,6 +3401,36 @@ fn config_unsupported_section_json_hint_741() {
             "config {section} JSON must include supported_sections (#741)"
         );
     }
+}
+
+#[test]
+fn config_help_returns_structured_section_list_344() {
+    // #344: /config help should return a structured section list, not an error
+    use std::process::Command;
+    let root = unique_temp_dir("config-help");
+    fs::create_dir_all(&root).expect("temp dir");
+    let bin = env!("CARGO_BIN_EXE_claw");
+    let output = Command::new(bin)
+        .current_dir(&root)
+        .args(["--output-format", "json", "config", "help"])
+        .output()
+        .expect("claw config help should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("config help should emit valid JSON");
+    assert_eq!(parsed["kind"], "config", "config help kind must be config");
+    assert_eq!(
+        parsed["status"], "ok",
+        "config help must return status:ok (#344)"
+    );
+    assert_eq!(
+        parsed["section"], "help",
+        "config help section must be help"
+    );
+    let sections = parsed["available_sections"]
+        .as_array()
+        .expect("config help must have available_sections array");
+    assert!(!sections.is_empty(), "available_sections must not be empty");
 }
 
 #[test]
@@ -3866,7 +3915,7 @@ fn agents_plugins_mcp_unknown_subcommand_have_hint_774() {
         };
         let parsed: serde_json::Value =
             serde_json::from_str(json_str.trim()).expect("mcp bogus should emit JSON");
-        assert_eq!(parsed["error_kind"], "unknown_mcp_action");
+        assert_eq!(parsed["error_kind"], "unsupported_action");
         let hint = parsed["hint"].as_str().unwrap_or("");
         assert!(!hint.is_empty(), "mcp bogus hint must be non-null (#774)");
     }
@@ -4146,8 +4195,8 @@ fn acp_unsupported_invocation_has_hint_782() {
         .expect("hint must be non-null (#782)");
     assert!(!hint.is_empty(), "hint must not be empty");
     assert!(
-        hint.contains("discoverability") || hint.contains("ROADMAP"),
-        "hint should explain the discoverability-only status, got: {hint:?}"
+        hint.contains("not implemented") || hint.contains("unsupported"),
+        "hint should explain the not-implemented status, got: {hint:?}"
     );
 }
 

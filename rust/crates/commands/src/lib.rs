@@ -1572,7 +1572,10 @@ fn parse_clear_args(args: &[&str]) -> Result<bool, SlashCommandParseError> {
 fn parse_config_section(args: &[&str]) -> Result<Option<String>, SlashCommandParseError> {
     let section = optional_single_arg("config", args, "[env|hooks|model|plugins]")?;
     if let Some(section) = section {
-        if matches!(section.as_str(), "env" | "hooks" | "model" | "plugins") {
+        if matches!(
+            section.as_str(),
+            "env" | "hooks" | "model" | "plugins" | "help"
+        ) {
             return Ok(Some(section));
         }
         return Err(command_error(
@@ -2147,7 +2150,7 @@ impl DefinitionSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AgentSummary {
+pub(crate) struct AgentSummary {
     name: String,
     description: Option<String>,
     model: Option<String>,
@@ -2156,6 +2159,20 @@ struct AgentSummary {
     shadowed_by: Option<DefinitionSource>,
     // #728: on-disk path so `agents show` can surface the file path
     path: Option<PathBuf>,
+}
+
+/// An agent definition file that could not be loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvalidAgentConfig {
+    pub(crate) path: PathBuf,
+    pub(crate) reason: String,
+}
+
+/// Loaded agent definitions plus any invalid entries that were skipped.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgentCollection {
+    pub(crate) agents: Vec<AgentSummary>,
+    pub(crate) invalid_agents: Vec<InvalidAgentConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2167,6 +2184,23 @@ struct SkillSummary {
     origin: SkillOrigin,
     // #729: on-disk path parity with AgentSummary
     path: Option<PathBuf>,
+    // #445: directory name for detecting name/dir mismatch
+    dir_name: Option<String>,
+}
+
+/// A skill where the frontmatter name differs from the directory name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillMetadataDrift {
+    pub(crate) dir_name: String,
+    pub(crate) frontmatter_name: String,
+    pub(crate) path: PathBuf,
+}
+
+/// Loaded skill definitions plus any metadata drift entries.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SkillCollection {
+    pub(crate) skills: Vec<SkillSummary>,
+    pub(crate) metadata_drift: Vec<SkillMetadataDrift>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2280,13 +2314,15 @@ pub fn handle_plugins_slash_command(
                 });
             };
             let plugin = resolve_plugin_target(manager, target)?;
+            let already_enabled = plugin.enabled;
             manager.enable(&plugin.metadata.id)?;
             Ok(PluginsCommandResult {
                 message: format!(
-                    "Plugins\n  Result           enabled {}\n  Name             {}\n  Version          {}\n  Status           enabled",
-                    plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
+                    "Plugins\n  Result           {}\n  Name             {}\n  Version          {}\n  Status           enabled",
+                    if already_enabled { "already enabled" } else { "enabled" },
+                    plugin.metadata.name, plugin.metadata.version
                 ),
-                reload_runtime: true,
+                reload_runtime: !already_enabled,
             })
         }
         Some("disable") => {
@@ -2297,13 +2333,15 @@ pub fn handle_plugins_slash_command(
                 });
             };
             let plugin = resolve_plugin_target(manager, target)?;
+            let already_disabled = !plugin.enabled;
             manager.disable(&plugin.metadata.id)?;
             Ok(PluginsCommandResult {
                 message: format!(
-                    "Plugins\n  Result           disabled {}\n  Name             {}\n  Version          {}\n  Status           disabled",
-                    plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
+                    "Plugins\n  Result           {}\n  Name             {}\n  Version          {}\n  Status           disabled",
+                    if already_disabled { "already disabled" } else { "disabled" },
+                    plugin.metadata.name, plugin.metadata.version
                 ),
-                reload_runtime: true,
+                reload_runtime: !already_disabled,
             })
         }
         Some("remove") | Some("uninstall") => {
@@ -2494,8 +2532,8 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_definition_roots(cwd, "agents");
-            let agents = load_agents_from_roots(&roots)?;
-            Ok(render_agents_report_json(cwd, &agents))
+            let collection = load_agents_from_roots_with_invalids(&roots)?;
+            Ok(render_agents_report_json(cwd, &collection))
         }
         Some(args) if args.starts_with("list ") => {
             let filter = args["list ".len()..].trim().to_lowercase();
@@ -2512,17 +2550,26 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 }));
             }
             let roots = discover_definition_roots(cwd, "agents");
-            let agents = load_agents_from_roots(&roots)?;
-            let filtered: Vec<_> = agents
+            let collection = load_agents_from_roots_with_invalids(&roots)?;
+            let filtered_agents: Vec<_> = collection
+                .agents
                 .into_iter()
                 .filter(|a| a.name.to_lowercase().contains(&filter))
                 .collect();
-            Ok(render_agents_report_json(cwd, &filtered))
+            let filtered_collection = AgentCollection {
+                agents: filtered_agents,
+                invalid_agents: collection.invalid_agents,
+            };
+            Ok(render_agents_report_json(cwd, &filtered_collection))
         }
         Some("show" | "info" | "describe") => {
             let roots = discover_definition_roots(cwd, "agents");
-            let agents = load_agents_from_roots(&roots)?;
-            Ok(render_agents_report_json_with_action(cwd, &agents, "show"))
+            let collection = load_agents_from_roots_with_invalids(&roots)?;
+            Ok(render_agents_report_json_with_action(
+                cwd,
+                &collection,
+                "show",
+            ))
         }
         Some(args)
             if args.starts_with("show ")
@@ -2553,8 +2600,9 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 }));
             }
             let roots = discover_definition_roots(cwd, "agents");
-            let agents = load_agents_from_roots(&roots)?;
-            let matched: Vec<_> = agents
+            let collection = load_agents_from_roots_with_invalids(&roots)?;
+            let matched: Vec<_> = collection
+                .agents
                 .into_iter()
                 .filter(|a| a.name.to_lowercase() == name)
                 .collect();
@@ -2571,7 +2619,15 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                     "hint": "Run `claw agents list` to see available agents.",
                 }));
             }
-            Ok(render_agents_report_json_with_action(cwd, &matched, "show"))
+            let matched_collection = AgentCollection {
+                agents: matched,
+                invalid_agents: collection.invalid_agents,
+            };
+            Ok(render_agents_report_json_with_action(
+                cwd,
+                &matched_collection,
+                "show",
+            ))
         }
         Some("create") => Ok(render_agents_missing_argument_json("create", "agent_name")),
         Some(args) if args.starts_with("create ") => {
@@ -2766,8 +2822,8 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
-            Ok(render_skills_report_json_with_action(&skills, "list"))
+            let collection = load_skills_from_roots_with_drift(&roots)?;
+            Ok(render_skills_report_json_with_action(&collection, "list"))
         }
         Some(args) if args.starts_with("list ") => {
             let filter = args["list ".len()..].trim().to_lowercase();
@@ -2784,17 +2840,25 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 }));
             }
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
-            let filtered: Vec<_> = skills
+            let collection = load_skills_from_roots_with_drift(&roots)?;
+            let filtered_skills: Vec<_> = collection
+                .skills
                 .into_iter()
                 .filter(|s| s.name.to_lowercase().contains(&filter))
                 .collect();
-            Ok(render_skills_report_json_with_action(&filtered, "list"))
+            let filtered_collection = SkillCollection {
+                skills: filtered_skills,
+                metadata_drift: collection.metadata_drift,
+            };
+            Ok(render_skills_report_json_with_action(
+                &filtered_collection,
+                "list",
+            ))
         }
         Some("show" | "info" | "describe") => {
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
-            Ok(render_skills_report_json_with_action(&skills, "show"))
+            let collection = load_skills_from_roots_with_drift(&roots)?;
+            Ok(render_skills_report_json_with_action(&collection, "show"))
         }
         Some(args)
             if args.starts_with("show ")
@@ -2825,8 +2889,9 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 }));
             }
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
-            let matched: Vec<_> = skills
+            let collection = load_skills_from_roots_with_drift(&roots)?;
+            let matched: Vec<_> = collection
+                .skills
                 .into_iter()
                 .filter(|s| s.name.to_lowercase() == name)
                 .collect();
@@ -2843,7 +2908,14 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                     "hint": "Run `claw skills list` to see available skills.",
                 }));
             }
-            Ok(render_skills_report_json_with_action(&matched, "show"))
+            let matched_collection = SkillCollection {
+                skills: matched,
+                metadata_drift: collection.metadata_drift,
+            };
+            Ok(render_skills_report_json_with_action(
+                &matched_collection,
+                "show",
+            ))
         }
         Some("install") => Ok(render_skills_missing_argument_json(
             "install",
@@ -3243,7 +3315,15 @@ fn render_mcp_report_json_for(
                 "use `claw mcp show <server>` to inspect a server",
             ))
         }
-        Some(args) => Ok(render_mcp_usage_json(Some(args))),
+        Some(args) => {
+            // #681: unsupported mutation verbs (add, remove, delete, enable, disable)
+            // and other unknown sub-actions return a typed error instead of help with exit 0.
+            let verb = args.split_whitespace().next().unwrap_or(args);
+            Ok(render_mcp_unsupported_action_json(
+                args,
+                &format!("`{verb}` is not a supported MCP sub-action; supported actions: list, show, help"),
+            ))
+        }
     }
 }
 
@@ -3902,30 +3982,69 @@ fn push_unique_skill_root(
 fn load_agents_from_roots(
     roots: &[(DefinitionSource, PathBuf)],
 ) -> std::io::Result<Vec<AgentSummary>> {
+    let collection = load_agents_from_roots_with_invalids(roots)?;
+    Ok(collection.agents)
+}
+
+/// Load agent definitions from all roots, collecting both valid agents and
+/// invalid entries (wrong extension, broken frontmatter, etc.).
+fn load_agents_from_roots_with_invalids(
+    roots: &[(DefinitionSource, PathBuf)],
+) -> std::io::Result<AgentCollection> {
     let mut agents = Vec::new();
+    let mut invalid_agents = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
 
     for (source, root) in roots {
         let mut root_agents = Vec::new();
         for entry in fs::read_dir(root)? {
             let entry = entry?;
-            if entry.path().extension().is_none_or(|ext| ext != "toml") {
-                continue;
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str());
+            match ext {
+                Some("toml") => {
+                    let contents = fs::read_to_string(&path)?;
+                    let fallback_name = path.file_stem().map_or_else(
+                        || entry.file_name().to_string_lossy().to_string(),
+                        |stem| stem.to_string_lossy().to_string(),
+                    );
+                    root_agents.push(AgentSummary {
+                        name: parse_toml_string(&contents, "name").unwrap_or(fallback_name),
+                        description: parse_toml_string(&contents, "description"),
+                        model: parse_toml_string(&contents, "model"),
+                        reasoning_effort: parse_toml_string(&contents, "model_reasoning_effort"),
+                        source: *source,
+                        shadowed_by: None,
+                        path: Some(path),
+                    });
+                }
+                Some("md") => {
+                    let contents = fs::read_to_string(&path)?;
+                    let (name, description, model, reasoning_effort) =
+                        parse_agent_frontmatter(&contents);
+                    if name.is_none() && description.is_none() {
+                        invalid_agents.push(InvalidAgentConfig {
+                            path,
+                            reason: "Markdown agent file has no YAML frontmatter with name or description fields".to_string(),
+                        });
+                        continue;
+                    }
+                    let fallback_name = path.file_stem().map_or_else(
+                        || entry.file_name().to_string_lossy().to_string(),
+                        |stem| stem.to_string_lossy().to_string(),
+                    );
+                    root_agents.push(AgentSummary {
+                        name: name.unwrap_or(fallback_name),
+                        description,
+                        model,
+                        reasoning_effort,
+                        source: *source,
+                        shadowed_by: None,
+                        path: Some(path),
+                    });
+                }
+                _ => continue,
             }
-            let contents = fs::read_to_string(entry.path())?;
-            let fallback_name = entry.path().file_stem().map_or_else(
-                || entry.file_name().to_string_lossy().to_string(),
-                |stem| stem.to_string_lossy().to_string(),
-            );
-            root_agents.push(AgentSummary {
-                name: parse_toml_string(&contents, "name").unwrap_or(fallback_name),
-                description: parse_toml_string(&contents, "description"),
-                model: parse_toml_string(&contents, "model"),
-                reasoning_effort: parse_toml_string(&contents, "model_reasoning_effort"),
-                source: *source,
-                shadowed_by: None,
-                path: Some(entry.path()),
-            });
         }
         root_agents.sort_by(|left, right| left.name.cmp(&right.name));
 
@@ -3940,11 +4059,22 @@ fn load_agents_from_roots(
         }
     }
 
-    Ok(agents)
+    Ok(AgentCollection {
+        agents,
+        invalid_agents,
+    })
 }
 
 fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
+    let collection = load_skills_from_roots_with_drift(roots)?;
+    Ok(collection.skills)
+}
+
+/// Load skill definitions from all roots, collecting metadata drift entries
+/// where the frontmatter name differs from the directory name.
+fn load_skills_from_roots_with_drift(roots: &[SkillRoot]) -> std::io::Result<SkillCollection> {
     let mut skills = Vec::new();
+    let mut metadata_drift = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
 
     for root in roots {
@@ -3961,15 +4091,26 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                         continue;
                     }
                     let contents = fs::read_to_string(skill_path)?;
+                    let dir_name = entry.file_name().to_string_lossy().to_string();
                     let (name, description) = parse_skill_frontmatter(&contents);
+                    // #445: detect name/dir mismatch
+                    if let Some(ref frontmatter_name) = name {
+                        if frontmatter_name != &dir_name {
+                            metadata_drift.push(SkillMetadataDrift {
+                                dir_name: dir_name.clone(),
+                                frontmatter_name: frontmatter_name.clone(),
+                                path: entry.path(),
+                            });
+                        }
+                    }
                     root_skills.push(SkillSummary {
-                        name: name
-                            .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
+                        name: name.unwrap_or_else(|| dir_name.clone()),
                         description,
                         source: root.source,
                         shadowed_by: None,
                         origin: root.origin,
                         path: Some(entry.path()),
+                        dir_name: Some(dir_name),
                     });
                 }
                 SkillOrigin::LegacyCommandsDir => {
@@ -4002,6 +4143,7 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                         shadowed_by: None,
                         origin: root.origin,
                         path: Some(markdown_path),
+                        dir_name: None,
                     });
                 }
             }
@@ -4019,7 +4161,10 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
         }
     }
 
-    Ok(skills)
+    Ok(SkillCollection {
+        skills,
+        metadata_drift,
+    })
 }
 
 fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
@@ -4091,6 +4236,63 @@ fn unquote_frontmatter_value(value: &str) -> String {
         .to_string()
 }
 
+/// Parse agent metadata from YAML frontmatter in `.md` agent files.
+/// Returns (name, description, model, reasoning_effort) extracted from
+/// the `---`-delimited YAML block at the top of the file.
+fn parse_agent_frontmatter(
+    contents: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return (None, None, None, None);
+    }
+
+    let mut name = None;
+    let mut description = None;
+    let mut model = None;
+    let mut reasoning_effort = None;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            let value = unquote_frontmatter_value(value.trim());
+            if !value.is_empty() {
+                name = Some(value);
+            }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("description:") {
+            let value = unquote_frontmatter_value(value.trim());
+            if !value.is_empty() {
+                description = Some(value);
+            }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("model:") {
+            let value = unquote_frontmatter_value(value.trim());
+            if !value.is_empty() {
+                model = Some(value);
+            }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("model_reasoning_effort:") {
+            let value = unquote_frontmatter_value(value.trim());
+            if !value.is_empty() {
+                reasoning_effort = Some(value);
+            }
+        }
+    }
+
+    (name, description, model, reasoning_effort)
+}
+
 fn render_agents_report(agents: &[AgentSummary]) -> String {
     if agents.is_empty() {
         return "No agents found.".to_string();
@@ -4133,31 +4335,42 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
     lines.join("\n").trim_end().to_string()
 }
 
-fn render_agents_report_json(cwd: &Path, agents: &[AgentSummary]) -> Value {
-    render_agents_report_json_with_action(cwd, agents, "list")
+fn render_agents_report_json(cwd: &Path, collection: &AgentCollection) -> Value {
+    render_agents_report_json_with_action(cwd, collection, "list")
 }
 
 fn render_agents_report_json_with_action(
     cwd: &Path,
-    agents: &[AgentSummary],
+    collection: &AgentCollection,
     action: &str,
 ) -> Value {
+    let agents = &collection.agents;
+    let invalid_agents = &collection.invalid_agents;
     let active = agents
         .iter()
         .filter(|agent| agent.shadowed_by.is_none())
         .count();
+    let has_invalids = !invalid_agents.is_empty();
+    let status = if has_invalids { "degraded" } else { "ok" };
     json!({
         "kind": "agents",
-        "status": "ok",
+        "status": status,
         "action": action,
         "working_directory": cwd.display().to_string(),
         "count": agents.len(),
+        "valid_count": agents.len(),
+        "invalid_count": invalid_agents.len(),
         "summary": {
             "total": agents.len(),
             "active": active,
             "shadowed": agents.len().saturating_sub(active),
         },
         "agents": agents.iter().map(agent_summary_json).collect::<Vec<_>>(),
+        "invalid_agents": invalid_agents.iter().map(|invalid| json!({
+            "path": invalid.path.display().to_string(),
+            "reason": &invalid.reason,
+            "valid": false,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -4277,21 +4490,34 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
     lines.join("\n").trim_end().to_string()
 }
 
-fn render_skills_report_json_with_action(skills: &[SkillSummary], action: &str) -> Value {
+fn render_skills_report_json_with_action(collection: &SkillCollection, action: &str) -> Value {
+    let skills = &collection.skills;
+    let metadata_drift = &collection.metadata_drift;
     let active = skills
         .iter()
         .filter(|skill| skill.shadowed_by.is_none())
         .count();
+    let has_drift = !metadata_drift.is_empty();
+    let status = if has_drift { "degraded" } else { "ok" };
+    // #410: add `count` field for polymorphic consumption parity with agents list
     json!({
         "kind": "skills",
-        "status": "ok",
+        "status": status,
         "action": action,
+        "count": skills.len(),
+        "valid_count": skills.len(),
+        "metadata_drift_count": metadata_drift.len(),
         "summary": {
             "total": skills.len(),
             "active": active,
             "shadowed": skills.len().saturating_sub(active),
         },
         "skills": skills.iter().map(skill_summary_json).collect::<Vec<_>>(),
+        "metadata_drift": metadata_drift.iter().map(|drift| json!({
+            "dir_name": &drift.dir_name,
+            "frontmatter_name": &drift.frontmatter_name,
+            "path": drift.path.display().to_string(),
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -4467,6 +4693,7 @@ fn render_mcp_summary_report_json(cwd: &Path, mcp: &McpConfigCollection) -> Valu
     json!({
         "kind": "mcp",
         "action": "list",
+        "count": mcp.valid_count(),
         "working_directory": cwd.display().to_string(),
         "configured_servers": mcp.valid_count(),
         "total_configured": mcp.total_configured(),
@@ -4652,7 +4879,7 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
             "direct_cli": "claw agents [list|show <name>|create <name>|help]",
             "format": "toml",
             "create": "claw agents create <name>",
-            "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
+            "sources": [".claw/agents", "~/.claw/agents", "~/.codex/agents", "$CLAW_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
     })
@@ -4782,7 +5009,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
             "direct_cli": "claw mcp [list|show <server>|help]",
-            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+            "sources": [".claw.json", ".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
     })
@@ -4970,31 +5197,48 @@ fn mcp_oauth_json(oauth: Option<&McpOAuthConfig>) -> Value {
 }
 
 fn mcp_server_details_json(config: &McpServerConfig) -> Value {
+    // #90: redact sensitive fields — args/url/headers_helper can contain
+    // credentials. Show structure without leaking secrets.
     match config {
         McpServerConfig::Stdio(config) => json!({
             "command": &config.command,
-            "args": &config.args,
+            "args_count": config.args.len(),
             "env_keys": config.env.keys().cloned().collect::<Vec<_>>(),
             "tool_call_timeout_ms": config.tool_call_timeout_ms,
         }),
-        McpServerConfig::Sse(config) | McpServerConfig::Http(config) => json!({
-            "url": &config.url,
-            "header_keys": config.headers.keys().cloned().collect::<Vec<_>>(),
-            "headers_helper": &config.headers_helper,
-            "oauth": mcp_oauth_json(config.oauth.as_ref()),
-        }),
-        McpServerConfig::Ws(config) => json!({
-            "url": &config.url,
-            "header_keys": config.headers.keys().cloned().collect::<Vec<_>>(),
-            "headers_helper": &config.headers_helper,
-        }),
+        McpServerConfig::Sse(config) | McpServerConfig::Http(config) => {
+            let redacted_url = redact_url(&config.url);
+            json!({
+                "url": redacted_url,
+                "header_keys": config.headers.keys().cloned().collect::<Vec<_>>(),
+                "headers_helper_configured": config.headers_helper.is_some(),
+                "oauth": mcp_oauth_json(config.oauth.as_ref()),
+            })
+        }
+        McpServerConfig::Ws(config) => {
+            let redacted_url = redact_url(&config.url);
+            json!({
+                "url": redacted_url,
+                "header_keys": config.headers.keys().cloned().collect::<Vec<_>>(),
+                "headers_helper_configured": config.headers_helper.is_some(),
+            })
+        }
         McpServerConfig::Sdk(config) => json!({
             "name": &config.name,
         }),
         McpServerConfig::ManagedProxy(config) => json!({
-            "url": &config.url,
+            "url": redact_url(&config.url),
             "id": &config.id,
         }),
+    }
+}
+
+fn redact_url(url: &str) -> String {
+    // #90: strip query params which may contain tokens, keep scheme+host+path
+    if let Some(query_start) = url.find('?') {
+        format!("{}?...", &url[..query_start])
+    } else {
+        url.to_string()
     }
 }
 
@@ -5127,7 +5371,7 @@ mod tests {
         render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
         render_plugins_report_with_failures, render_skills_report, render_slash_command_help,
         render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        slash_command_specs, suggest_slash_commands, validate_slash_command_input,
+        slash_command_specs, suggest_slash_commands, validate_slash_command_input, AgentCollection,
         DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{
@@ -6121,7 +6365,10 @@ mod tests {
         ];
         let report = render_agents_report_json(
             &workspace,
-            &load_agents_from_roots(&roots).expect("agent roots should load"),
+            &AgentCollection {
+                agents: load_agents_from_roots(&roots).expect("agent roots should load"),
+                invalid_agents: Vec::new(),
+            },
         );
 
         assert_eq!(report["kind"], "agents");
@@ -6274,7 +6521,10 @@ mod tests {
             },
         ];
         let report = super::render_skills_report_json_with_action(
-            &load_skills_from_roots(&roots).expect("skills should load"),
+            &super::SkillCollection {
+                skills: load_skills_from_roots(&roots).expect("skills should load"),
+                metadata_drift: Vec::new(),
+            },
             "list",
         );
         assert_eq!(report["kind"], "skills");
@@ -6647,7 +6897,7 @@ mod tests {
         let help =
             render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
+        assert_eq!(help["usage"]["sources"][0], ".claw.json");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
@@ -6845,7 +7095,7 @@ mod tests {
         let disable = handle_plugins_slash_command(Some("disable"), Some("demo"), &mut manager)
             .expect("disable command should succeed");
         assert!(disable.reload_runtime);
-        assert!(disable.message.contains("disabled demo@external"));
+        assert!(disable.message.contains("Result           disabled"));
         assert!(disable.message.contains("Name             demo"));
         assert!(disable.message.contains("Status           disabled"));
 
@@ -6857,7 +7107,7 @@ mod tests {
         let enable = handle_plugins_slash_command(Some("enable"), Some("demo"), &mut manager)
             .expect("enable command should succeed");
         assert!(enable.reload_runtime);
-        assert!(enable.message.contains("enabled demo@external"));
+        assert!(enable.message.contains("Result           enabled"));
         assert!(enable.message.contains("Name             demo"));
         assert!(enable.message.contains("Status           enabled"));
 
